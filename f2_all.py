@@ -10,6 +10,16 @@ CORRECCIONES METODOLÓGICAS (2026-07-03):
   - _meta completo: cooldown_s, baseline_avg_us, lat_avg_us, buffer_effective_bytes
   - BALANCEO MANUAL: F2-S2 ahora distribuye flujos entre S1 y S2 para que
     Spine-Leaf use sus múltiples caminos de forma balanceada.
+  - FIX (2026-07-06): detect_inflexion() comparaba contra el baseline en
+    silencio total (medir_baseline_limpio), pero cualquier nivel con
+    main_flow+extras corriendo ya está muy por encima de ese baseline,
+    disparando una "inflexión" trivial en el primer nivel evaluado sin
+    importar la carga real de oversubscripción (confirmado empíricamente:
+    el buffer estimado no cambiaba aunque se probaran distintos rangos de
+    OVERSUB_LEVELS). Ahora compara contra la latencia del propio nivel 0%
+    (con main_flow+extras ya establecidos, probe insignificante), que es
+    la referencia metodológicamente correcta para medir el efecto del
+    incremento de oversubscripción del probe.
 
 Ejecutar desde H3 (host de control):
     python3 f2_all.py --scenario all --topology sl --protocol udp
@@ -38,12 +48,12 @@ DURATION = 20
 COOLDOWN = 10          # CORREGIDO: 10s para drenaje completo
 PKT_PAUSE = 10
 RSD_TARGET = 10.0
-REPS_MIN = 2
-REPS_MAX = 2
+REPS_MIN = 15
+REPS_MAX = 30
 INFLECTION_PCT = 15.0
 INFLECTION_ABS_US = 500
 
-OVERSUB_LEVELS = [0, 2, 4, 6, 8]
+OVERSUB_LEVELS = [0, 2, 4, 6, 8, 10, 12, 15, 20, 30, 50]
 PKT_SIZES = [1518, 512]
 
 # Puertos usados por los servidores iperf3 en los hosts destino "secundarios"
@@ -208,15 +218,21 @@ def calcular_buffer(baseline_avg_us, inflexion_avg_us):
         return None
     return round((buffer_lat_us / 1_000_000) * LINE_RATE_BPS / 8)
 
-def detect_inflexion(level_summaries, baseline_avg_us):
+def detect_inflexion(level_summaries, nivel0_avg_us):
     """
-    CRITERIO CORREGIDO (F2 v3):
-    - Busca el PRIMER nivel (empezando por el 1) donde:
-        a) lat_avg_us > baseline_avg_us * (1 + INFLECTION_PCT/100)
-        b) lat_avg_us > baseline_avg_us + INFLECTION_ABS_US
+    CRITERIO CORREGIDO (F2 v4):
+    - Compara contra el NIVEL 0% (main_flow + extras ya corriendo, probe
+      insignificante), NO contra el baseline en silencio total. El baseline
+      en silencio siempre está muy por debajo de cualquier nivel con
+      main_flow activo, lo que antes disparaba una "inflexión" trivial en
+      el primer nivel evaluado sin importar la carga real de oversubscripción.
+    - Busca el PRIMER nivel (empezando por el segundo elemento de la lista,
+      es decir el primer nivel >0%) donde:
+        a) lat_avg_us > nivel0_avg_us * (1 + INFLECTION_PCT/100)
+        b) lat_avg_us > nivel0_avg_us + INFLECTION_ABS_US
     - Retorna (nivel, lat_avg_us, criterio_usado)
     """
-    if baseline_avg_us is None or len(level_summaries) < 2:
+    if nivel0_avg_us is None or len(level_summaries) < 2:
         return None, None, None
 
     for i in range(1, len(level_summaries)):
@@ -225,12 +241,12 @@ def detect_inflexion(level_summaries, baseline_avg_us):
         if lat_avg is None:
             continue
 
-        # Criterio relativo (ej. 15% sobre baseline)
-        if lat_avg > baseline_avg_us * (1 + INFLECTION_PCT / 100.0):
+        # Criterio relativo (ej. 15% sobre el nivel 0%)
+        if lat_avg > nivel0_avg_us * (1 + INFLECTION_PCT / 100.0):
             return level_data["level"], lat_avg, "relativo"
 
-        # Criterio absoluto (ej. +500µs sobre baseline)
-        if lat_avg > baseline_avg_us + INFLECTION_ABS_US:
+        # Criterio absoluto (ej. +500µs sobre el nivel 0%)
+        if lat_avg > nivel0_avg_us + INFLECTION_ABS_US:
             return level_data["level"], lat_avg, "absoluto"
 
     return None, None, None
@@ -445,6 +461,7 @@ def run_protocol(topology, scenario, protocol, pkt_size, out_dir, dry_run):
     print(f"\n  {C.BOLD}── {protocol.upper()} / pkt {pkt_size}B ──{C.END}")
 
     baseline_avg_us, baseline_max_us = medir_baseline_limpio(dry_run)
+    nivel0_avg_us = None   # se llena con la latencia del nivel 0% (main_flow+extras ya corriendo)
     level_summaries = []
     inflexion_level = None
     inflexion_lat_avg = None
@@ -589,27 +606,32 @@ def run_protocol(topology, scenario, protocol, pkt_size, out_dir, dry_run):
         print(f"\n  → {rep} reps | lat_avg={avg_str} | "
               f"{'✔ converge' if converged else '⚠ no converge'}")
 
-        # Detectar inflexión
-        if inflexion_level is None and baseline_avg_us is not None:
-            inf_lvl, inf_lat, criterio = detect_inflexion(level_summaries, baseline_avg_us)
+        if level == 0 and lat_avg_avg is not None:
+            nivel0_avg_us = lat_avg_avg
+
+        # Detectar inflexión (comparando contra el nivel 0%, no contra
+        # el baseline en silencio total — ver docstring de detect_inflexion)
+        if inflexion_level is None and nivel0_avg_us is not None:
+            inf_lvl, inf_lat, criterio = detect_inflexion(level_summaries, nivel0_avg_us)
             if inf_lvl is not None:
                 inflexion_level = inf_lvl
                 inflexion_lat_avg = inf_lat
                 inflexion_criterio = criterio
-                buf = calcular_buffer(baseline_avg_us, inflexion_lat_avg)
+                buf = calcular_buffer(nivel0_avg_us, inflexion_lat_avg)
                 print(f"\n  {C.OK}★ Inflexión detectada en nivel {inflexion_level}%{C.END}")
                 print(f"  Criterio: {inflexion_criterio}")
                 if buf:
                     print(f"  Buffer: {buf:,} bytes ({buf/1024:.1f} KB)")
                 break
 
-    buffer_bytes = calcular_buffer(baseline_avg_us, inflexion_lat_avg)
+    buffer_bytes = calcular_buffer(nivel0_avg_us, inflexion_lat_avg)
 
     return {
         "protocol": protocol,
         "pkt_size_b": pkt_size,
         "baseline_avg_us": round(baseline_avg_us, 2) if baseline_avg_us else None,
         "baseline_max_us": round(baseline_max_us, 2) if baseline_max_us else None,
+        "nivel0_avg_us": round(nivel0_avg_us, 2) if nivel0_avg_us else None,
         "inflexion_level": inflexion_level,
         "inflexion_lat_us": round(inflexion_lat_avg, 2) if inflexion_lat_avg else None,
         "inflexion_criterio": inflexion_criterio,
