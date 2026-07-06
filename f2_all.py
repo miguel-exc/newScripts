@@ -1,0 +1,805 @@
+#!/usr/bin/env python3
+"""
+f2_all.py — F2 Buffering Testing (Unificado) — VERSIÓN HOMOGENIZADA
+RFC 8239 §3 — Testbed SDN Spine-Leaf vs Jerárquica 3 Capas — UASLP 2026
+
+CORRECCIONES METODOLÓGICAS (2026-07-03):
+  - Cooldown: 10s entre repeticiones (para drenaje de buffers)
+  - Inflexión: detectada usando lat_avg_us (NO lat_max_us)
+  - Criterio: lat_avg > baseline_avg * (1 + 15%) O lat_avg > baseline_avg + 500µs
+  - _meta completo: cooldown_s, baseline_avg_us, lat_avg_us, buffer_effective_bytes
+  - BALANCEO MANUAL: F2-S2 ahora distribuye flujos entre S1 y S2 para que
+    Spine-Leaf use sus múltiples caminos de forma balanceada.
+
+Ejecutar desde H3 (host de control):
+    python3 f2_all.py --scenario all --topology sl --protocol udp
+    python3 f2_all.py --scenario s2 --topology sl --protocol udp
+"""
+
+import argparse
+import json
+import statistics
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURACIÓN GLOBAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+EXPERIMENT_BASE = "f2"
+LINE_RATE_BPS = 1_000_000_000
+LINE_RATE_MBPS = 1000
+
+DURATION = 20
+COOLDOWN = 10          # CORREGIDO: 10s para drenaje completo
+PKT_PAUSE = 10
+RSD_TARGET = 10.0
+REPS_MIN = 2
+REPS_MAX = 2
+INFLECTION_PCT = 15.0
+INFLECTION_ABS_US = 500
+
+OVERSUB_LEVELS = [0, 10]
+PKT_SIZES = [1518, 512]
+
+# Puertos usados por los servidores iperf3 en los hosts destino "secundarios"
+# (los que reciben tráfico balanceado vía extra_targets, distintos del
+# target_host principal del escenario). Debe existir un servidor escuchando
+# en (host, puerto) para cada entrada usada en SCENARIOS[...]["extra_targets"].
+EXTRA_TARGET_PORT_MAP = {"H5": 5205, "H7": 5206}
+
+KEY_PATH = Path.home() / ".ssh" / "id_rsa_testbed"
+OUTPUT_BASE = Path.home() / "experimentos"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURACIÓN POR TOPOLOGÍA Y ESCENARIO
+# ══════════════════════════════════════════════════════════════════════════════
+
+TOPOLOGIES = {
+    "sl": {
+        "hosts": {
+            "H1": {"ip": "10.0.1.1", "user": "h1"},
+            "H2": {"ip": "10.0.1.2", "user": "h2"},
+            "H3": {"ip": "10.0.1.3", "user": "h3"},
+            "H4": {"ip": "10.0.2.1", "user": "h4"},
+            "H5": {"ip": "10.0.2.2", "user": "h5"},
+            "H6": {"ip": "10.0.2.3", "user": "h6"},
+            "H7": {"ip": "10.0.3.1", "user": "h7"},
+            "H8": {"ip": "10.0.3.2", "user": "h8"},
+        }
+    },
+    "j3c": {
+        "hosts": {
+            "H1": {"ip": "10.0.1.1", "user": "h1"},
+            "H2": {"ip": "10.0.1.2", "user": "h2"},
+            "H3": {"ip": "10.0.1.3", "user": "h3"},
+            "H4": {"ip": "10.0.1.4", "user": "h4"},
+            "H5": {"ip": "10.0.2.1", "user": "h5"},
+            "H6": {"ip": "10.0.2.2", "user": "h6"},
+            "H7": {"ip": "10.0.2.3", "user": "h7"},
+            "H8": {"ip": "10.0.2.4", "user": "h8"},
+        }
+    }
+}
+
+# Escenarios: S1 (2 ingress) y S2 (4 ingress)
+# F2-S2 ahora está balanceado: los flujos se distribuyen entre S1 y S2
+SCENARIOS = {
+    "s1": {
+        "id": "s1",
+        "desc": {
+            "sl": "H1 (L1) + H4 (L2) → H7 (L3) — 2 ingress cross-leaf",
+            "j3c": "H1 + H4 (Edge1) → H5 (Edge2) — 2 ingress cruzando Core1"
+        },
+        "main_host": "H1",
+        "probe_host": "H4",
+        "target_host": {"sl": "H7", "j3c": "H5"},
+        "extra_hosts": [],
+        "main_port": 5201,
+        "probe_port": 5202,
+        "extra_ports": [],
+    },
+    "s2": {
+        "id": "s2",
+        "desc": {
+            "sl": "H1+H2+H4 → H5+H7 — BALANCEADO: usa S1 y S2",
+            "j3c": "H1+H2+H3+H4 (Edge1) → H5 (Edge2) — 4 ingress cruzando Core1"
+        },
+        "main_host": "H1",
+        "probe_host": "H4",
+        "target_host": {"sl": "H5", "j3c": "H5"},  # SL: destino balanceado entre H5 y H7
+        "extra_hosts": {"sl": ["H2", "H4"], "j3c": ["H2", "H3"]},
+        "main_port": 5201,
+        "probe_port": 5202,
+        "extra_ports": [5203, 5204],
+        # NUEVO: destinos específicos para flujos extra en SL (balanceado)
+        "extra_targets": {"sl": {"H2": "H7", "H4": "H5"}},  # H2→H7 (S2), H4→H5 (S1)
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COLORES
+# ══════════════════════════════════════════════════════════════════════════════
+
+class C:
+    OK = "\033[92m"
+    WARN = "\033[93m"
+    FAIL = "\033[91m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    END = "\033[0m"
+
+def ok(msg): print(f"  {C.OK}✔{C.END}  {msg}")
+def warn(msg): print(f"  {C.WARN}⚠{C.END}  {msg}")
+def fail(msg): print(f"  {C.FAIL}✘{C.END}  {msg}")
+def info(msg): print(f"  →  {msg}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS SSH
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SSH_OPTS = [
+    "ssh", "-i", str(KEY_PATH),
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=10",
+    "-o", "ServerAliveInterval=15",
+]
+
+def ssh_run(host_key, cmd, timeout=60):
+    h = HOSTS[host_key]
+    return subprocess.run(
+        _SSH_OPTS + [f"{h['user']}@{h['ip']}", cmd],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+def ssh_bg(host_key, cmd):
+    h = HOSTS[host_key]
+    subprocess.Popen(
+        _SSH_OPTS + [f"{h['user']}@{h['ip']}", f"nohup {cmd} >/dev/null 2>&1 &"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+def kill_iperf(host_key):
+    ssh_run(host_key, "pkill -9 iperf3 2>/dev/null; true", timeout=8)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS DE FUNCIONES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def probe_rate_mbps(level):
+    if level == 0:
+        return 10
+    return round(LINE_RATE_MBPS * level / 100)
+
+def extra_target_hosts(topology):
+    """Hosts destino secundarios (distintos de target_host) que aparecen en
+    extra_targets para esta topología. Necesitan su propio servidor iperf3."""
+    extra_targets = SCENARIO.get("extra_targets", {}).get(topology, {})
+    return {h for h in extra_targets.values() if h != SCENARIO["target_host"]}
+
+def compute_rsd(values):
+    clean = [v for v in values if v is not None]
+    if len(clean) < 2:
+        return None
+    mean = statistics.mean(clean)
+    if mean == 0:
+        return None
+    return (statistics.stdev(clean) / mean) * 100
+
+def nombre_archivo(topology, scenario, protocol, pkt_size, level, rep):
+    return (
+        f"{topology}_{EXPERIMENT_BASE}{scenario}_{protocol}"
+        f"_pkt{pkt_size:04d}"
+        f"_lvl{level:02d}"
+        f"_rep{rep:02d}.json"
+    )
+
+def calcular_buffer(baseline_avg_us, inflexion_avg_us):
+    """Calcula buffer efectivo en bytes usando latencia promedio."""
+    if baseline_avg_us is None or inflexion_avg_us is None:
+        return None
+    buffer_lat_us = inflexion_avg_us - baseline_avg_us
+    if buffer_lat_us <= 0:
+        return None
+    return round((buffer_lat_us / 1_000_000) * LINE_RATE_BPS / 8)
+
+def detect_inflexion(level_summaries, baseline_avg_us):
+    """
+    CRITERIO CORREGIDO (F2 v3):
+    - Busca el PRIMER nivel (empezando por el 1) donde:
+        a) lat_avg_us > baseline_avg_us * (1 + INFLECTION_PCT/100)
+        b) lat_avg_us > baseline_avg_us + INFLECTION_ABS_US
+    - Retorna (nivel, lat_avg_us, criterio_usado)
+    """
+    if baseline_avg_us is None or len(level_summaries) < 2:
+        return None, None, None
+
+    for i in range(1, len(level_summaries)):
+        level_data = level_summaries[i]
+        lat_avg = level_data.get("lat_avg_us")
+        if lat_avg is None:
+            continue
+
+        # Criterio relativo (ej. 15% sobre baseline)
+        if lat_avg > baseline_avg_us * (1 + INFLECTION_PCT / 100.0):
+            return level_data["level"], lat_avg, "relativo"
+
+        # Criterio absoluto (ej. +500µs sobre baseline)
+        if lat_avg > baseline_avg_us + INFLECTION_ABS_US:
+            return level_data["level"], lat_avg, "absoluto"
+
+    return None, None, None
+
+def medir_baseline_limpio(dry_run):
+    """
+    Mide latencia ANTES de lanzar cualquier flujo iperf3.
+    RETORNA (lat_avg_us, lat_max_us) del baseline en reposo.
+    CORREGIDO: ahora retorna lat_avg como principal.
+    """
+    if dry_run:
+        return 1200.0, 1500.0
+
+    print(f"\n  Midiendo baseline limpio (sin carga)...", end="", flush=True)
+    ip_target = HOSTS[SCENARIO["target_host"]]["ip"]
+    cmd = f"ping -c 20 -i 0.2 {ip_target} 2>&1"
+
+    try:
+        res = ssh_run(SCENARIO["probe_host"], cmd, timeout=30)
+        for line in res.stdout.splitlines():
+            if "min/avg/max" in line or "rtt" in line.lower():
+                try:
+                    parts = line.split("=")[1].strip().split("/")
+                    lat_avg = float(parts[1]) * 1000
+                    lat_max = float(parts[2]) * 1000
+                    print(f" avg={lat_avg:.0f}µs max={lat_max:.0f}µs ✔")
+                    return lat_avg, lat_max
+                except (IndexError, ValueError):
+                    pass
+    except Exception as e:
+        print(f" error: {e}")
+
+    print(" no se pudo medir — usando None")
+    return None, None
+
+def start_iperf_servers(topology, dry_run):
+    if dry_run:
+        return
+    kill_iperf(SCENARIO["target_host"])
+    time.sleep(0.5)
+    ssh_bg(SCENARIO["target_host"], f"iperf3 -s -p {SCENARIO['main_port']}")
+    ssh_bg(SCENARIO["target_host"], f"iperf3 -s -p {SCENARIO['probe_port']}")
+    for port in SCENARIO["extra_ports"]:
+        ssh_bg(SCENARIO["target_host"], f"iperf3 -s -p {port}")
+
+    # Hosts destino secundarios del balanceo manual (ej. H7 en S2/SL):
+    # sin esto, cualquier flujo extra dirigido a un host distinto de
+    # target_host falla con connection refused en todas las repeticiones.
+    for alt_host in extra_target_hosts(topology):
+        alt_port = EXTRA_TARGET_PORT_MAP.get(alt_host)
+        if alt_port is None:
+            warn(f"Sin puerto mapeado para destino secundario {alt_host}; "
+                 f"agrega una entrada en EXTRA_TARGET_PORT_MAP")
+            continue
+        kill_iperf(alt_host)
+        ssh_bg(alt_host, f"iperf3 -s -p {alt_port}")
+
+    time.sleep(2)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FLUJOS IPERF3 (CON BALANCEO PARA S2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_main_flow(pkt_size, results, errors, dry_run):
+    if dry_run:
+        results["throughput_mbps"] = 999.0
+        return
+    ip_target = HOSTS[SCENARIO["target_host"]]["ip"]
+    cmd = (
+        f"iperf3 -c {ip_target} -p {SCENARIO['main_port']}"
+        f" -t {DURATION} -b 0 -C cubic -l {pkt_size} -J"
+    )
+    try:
+        res = ssh_run(SCENARIO["main_host"], cmd, timeout=DURATION + 20)
+        if res.returncode != 0 or not res.stdout.strip():
+            errors.append(f"main flow rc={res.returncode}")
+            results["throughput_mbps"] = None
+            return
+        data = json.loads(res.stdout)
+        results["throughput_mbps"] = round(
+            data["end"]["sum_sent"]["bits_per_second"] / 1e6, 2)
+    except Exception as e:
+        errors.append(str(e))
+        results["throughput_mbps"] = None
+
+def run_probe_flow(pkt_size, level, protocol, results, errors, dry_run):
+    if dry_run:
+        results["throughput_mbps"] = probe_rate_mbps(level) * 0.95
+        results["retransmits"] = 0
+        return
+    ip_target = HOSTS[SCENARIO["target_host"]]["ip"]
+    rate_mbps = probe_rate_mbps(level)
+    proto_flag = "-u" if protocol == "udp" else ""
+    cmd = (
+        f"iperf3 -c {ip_target} -p {SCENARIO['probe_port']}"
+        f" -t {DURATION} {proto_flag} -b {rate_mbps}M -C cubic -l {pkt_size} -J"
+    )
+    try:
+        res = ssh_run(SCENARIO["probe_host"], cmd, timeout=DURATION + 20)
+        if res.returncode != 0 or not res.stdout.strip():
+            errors.append(f"probe rc={res.returncode}")
+            results["throughput_mbps"] = None
+            results["retransmits"] = None
+            return
+        data = json.loads(res.stdout)
+        end = data["end"]
+        if protocol == "udp":
+            results["throughput_mbps"] = round(end["sum"]["bits_per_second"] / 1e6, 2)
+            results["lost_packets"] = end["sum"].get("lost_packets", 0)
+            results["retransmits"] = 0
+        else:
+            results["throughput_mbps"] = round(end["sum_sent"]["bits_per_second"] / 1e6, 2)
+            results["retransmits"] = end["sum_sent"].get("retransmits", 0)
+            results["lost_packets"] = 0
+    except Exception as e:
+        errors.append(str(e))
+        results["throughput_mbps"] = None
+        results["retransmits"] = None
+
+def run_extra_flow(host_key, port, pkt_size, protocol, rate_mbps,
+                   topology, results, errors, dry_run):
+    """
+    Flujo extra para S2. En SL, los destinos están balanceados:
+    - H2 → H7 (subred 3 → S2)
+    - H4 → H5 (subred 2 → S1)  [el probe ya usa H4→H7, así que extra usa H4→H5]
+    """
+    if dry_run:
+        results["throughput_mbps"] = rate_mbps * 0.9
+        return
+
+    # Determinar el destino según el host (balanceo manual)
+    extra_targets = SCENARIO.get("extra_targets", {}).get(topology, {})
+    target_host = extra_targets.get(host_key, SCENARIO["target_host"])
+    ip_target = HOSTS[target_host]["ip"]
+
+    # Determinar el puerto según el destino
+    # Si el destino es diferente al target_host principal, usamos el
+    # puerto del servidor "secundario" ya levantado por start_iperf_servers.
+    if target_host != SCENARIO["target_host"]:
+        actual_port = EXTRA_TARGET_PORT_MAP.get(target_host, port)
+    else:
+        actual_port = port
+    
+    proto_flag = "-u" if protocol == "udp" else ""
+    cmd = (
+        f"iperf3 -c {ip_target} -p {actual_port}"
+        f" -t {DURATION} {proto_flag} -b {rate_mbps}M -C cubic -l {pkt_size} -J"
+    )
+    try:
+        res = ssh_run(host_key, cmd, timeout=DURATION + 20)
+        if res.returncode != 0 or not res.stdout.strip():
+            errors.append(f"{host_key} extra rc={res.returncode}")
+            results["throughput_mbps"] = None
+            return
+        data = json.loads(res.stdout)
+        end = data["end"]
+        if protocol == "udp":
+            bps = end["sum"]["bits_per_second"]
+        else:
+            bps = end["sum_sent"]["bits_per_second"]
+        results["throughput_mbps"] = round(bps / 1e6, 2)
+    except Exception as e:
+        errors.append(str(e))
+        results["throughput_mbps"] = None
+
+def run_ping_client(duration, results, errors, dry_run):
+    if dry_run:
+        results["lat_avg_us"] = 1200.0
+        results["lat_max_us"] = 1500.0
+        return
+
+    ip_target = HOSTS[SCENARIO["target_host"]]["ip"]
+    count = max(10, duration * 5)
+    cmd = f"ping -c {count} -i 0.2 {ip_target} 2>&1"
+
+    try:
+        res = ssh_run(SCENARIO["probe_host"], cmd, timeout=duration + 20)
+        lat_avg = lat_max = None
+
+        for line in res.stdout.splitlines():
+            if "min/avg/max" in line or "rtt" in line.lower():
+                try:
+                    parts = line.split("=")[1].strip().split("/")
+                    lat_avg = float(parts[1]) * 1000
+                    lat_max = float(parts[2]) * 1000
+                except (IndexError, ValueError):
+                    pass
+
+        if lat_avg is None:
+            errors.append("ping: no se pudo parsear RTT")
+            results["lat_avg_us"] = None
+            results["lat_max_us"] = None
+            return
+
+        results["lat_avg_us"] = round(lat_avg, 2)
+        results["lat_max_us"] = round(lat_max, 2)
+
+    except subprocess.TimeoutExpired:
+        errors.append("ping timeout")
+        results["lat_avg_us"] = None
+        results["lat_max_us"] = None
+    except Exception as e:
+        errors.append(f"ping exception: {e}")
+        results["lat_avg_us"] = None
+        results["lat_max_us"] = None
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LOOP PRINCIPAL DE UN PROTOCOLO
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_protocol(topology, scenario, protocol, pkt_size, out_dir, dry_run):
+    print(f"\n  {C.BOLD}── {protocol.upper()} / pkt {pkt_size}B ──{C.END}")
+
+    baseline_avg_us, baseline_max_us = medir_baseline_limpio(dry_run)
+    level_summaries = []
+    inflexion_level = None
+    inflexion_lat_avg = None
+    inflexion_criterio = None
+
+    for level in OVERSUB_LEVELS:
+        rate_mbps = probe_rate_mbps(level)
+        extra_rate = max(5, rate_mbps // 3) if SCENARIO["extra_hosts"] else 0
+
+        print(f"\n  Nivel {level:>2d}% (+{rate_mbps:>4d}M) ", end="", flush=True)
+
+        lat_maxes = []
+        lat_avgs = []
+        rep = 0
+        converged = False
+
+        while rep < REPS_MAX:
+            rep += 1
+
+            if rep > 1:
+                for i in range(COOLDOWN, 0, -1):
+                    print(f"\r  Nivel {level:>2d}% rep {rep:02d}/{REPS_MAX} enfriando {i}s...  ",
+                          end="", flush=True)
+                    time.sleep(1)
+
+            print(f"\r  Nivel {level:>2d}% rep {rep:02d}/{REPS_MAX} midiendo...       ",
+                  end="", flush=True)
+
+            # Construir threads según escenario
+            res_main = {}; err_main = []
+            res_probe = {}; err_probe = []
+            res_lat = {}; err_lat = []
+            threads = [
+                threading.Thread(target=run_main_flow,
+                                 args=(pkt_size, res_main, err_main, dry_run)),
+                threading.Thread(target=run_probe_flow,
+                                 args=(pkt_size, level, protocol,
+                                       res_probe, err_probe, dry_run)),
+                threading.Thread(target=run_ping_client,
+                                 args=(DURATION, res_lat, err_lat, dry_run)),
+            ]
+
+            # Añadir flujos extra si hay (S2)
+            extra_results = []
+            extra_errors = []
+            if SCENARIO["extra_hosts"]:
+                for i, host in enumerate(SCENARIO["extra_hosts"]):
+                    res = {}; err = []
+                    threads.append(threading.Thread(
+                        target=run_extra_flow,
+                        args=(host, SCENARIO["extra_ports"][i], pkt_size,
+                              protocol, extra_rate, topology, res, err, dry_run)
+                    ))
+                    extra_results.append(res)
+                    extra_errors.append(err)
+
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=DURATION + 35)
+
+            for e in err_main + err_probe + err_lat:
+                print(f"\n    ⚠  {e}", end="")
+            for err_list in extra_errors:
+                for e in err_list:
+                    print(f"\n    ⚠  {e}", end="")
+
+            lat_avg = res_lat.get("lat_avg_us")
+            lat_max = res_lat.get("lat_max_us")
+
+            if lat_avg is not None:
+                lat_avgs.append(lat_avg)
+            if lat_max is not None:
+                lat_maxes.append(lat_max)
+
+            rsd = compute_rsd(lat_avgs) if len(lat_avgs) > 1 else 99.0
+            avg_str = f"{lat_avg:.1f}µs" if lat_avg else "N/A"
+            rsd_str = f"{rsd:.1f}%" if rsd is not None else "N/A"
+            print(f"\r  Nivel {level:>2d}% rep {rep:02d}/{REPS_MAX} "
+                  f"lat_avg={avg_str} RSD={rsd_str}   ",
+                  end="", flush=True)
+
+            # Guardar JSON
+            fname = nombre_archivo(topology, scenario, protocol, pkt_size, level, rep)
+            fpath = out_dir / fname
+            record = {
+                "_meta": {
+                    "experiment": f"{EXPERIMENT_BASE}{scenario}",
+                    "topology": topology,
+                    "scenario": SCENARIO["id"],
+                    "protocol": protocol,
+                    "pkt_size_b": pkt_size,
+                    "level_pct": level,
+                    "probe_rate_mbps": rate_mbps,
+                    "extra_rate_mbps": extra_rate,
+                    "rep": rep,
+                    "duration_s": DURATION,
+                    "cooldown_s": COOLDOWN,
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "rfc_reference": "RFC8239 §3 — Buffering Testing (corregido)",
+                    "baseline_avg_us": round(baseline_avg_us, 2) if baseline_avg_us else None,
+                    "baseline_max_us": round(baseline_max_us, 2) if baseline_max_us else None,
+                    "lat_avg_us": round(lat_avg, 2) if lat_avg else None,
+                    "lat_max_us": round(lat_max, 2) if lat_max else None,
+                },
+                "main_flow": res_main,
+                "probe_flow": res_probe,
+                "latency": res_lat,
+            }
+            if extra_results:
+                for i, res in enumerate(extra_results):
+                    record[f"extra_{i+1}_flow"] = res
+
+            if not dry_run:
+                fpath.write_text(json.dumps(record, indent=2))
+
+            if rep >= REPS_MIN and rsd is not None and rsd < RSD_TARGET:
+                converged = True
+                break
+
+        lat_max_avg = statistics.mean(lat_maxes) if lat_maxes else None
+        lat_avg_avg = statistics.mean(lat_avgs) if lat_avgs else None
+
+        # buffer acumulado por nivel
+        buffer_effective_bytes = None
+        if lat_avg_avg is not None and baseline_avg_us is not None:
+            buffer_lat_us = lat_avg_avg - baseline_avg_us
+            if buffer_lat_us > 0:
+                buffer_effective_bytes = round((buffer_lat_us / 1_000_000) * LINE_RATE_BPS / 8, 0)
+
+        level_summaries.append({
+            "level": level,
+            "lat_avg_us": round(lat_avg_avg, 2) if lat_avg_avg else None,
+            "lat_max_us": round(lat_max_avg, 2) if lat_max_avg else None,
+            "reps": rep,
+            "rsd_pct": round(rsd, 2) if rsd is not None else None,
+            "converged": converged,
+            "buffer_effective_bytes": buffer_effective_bytes,
+        })
+
+        avg_str = f"{lat_avg_avg:.1f}µs" if lat_avg_avg else "N/A"
+        print(f"\n  → {rep} reps | lat_avg={avg_str} | "
+              f"{'✔ converge' if converged else '⚠ no converge'}")
+
+        # Detectar inflexión
+        if inflexion_level is None and baseline_avg_us is not None:
+            inf_lvl, inf_lat, criterio = detect_inflexion(level_summaries, baseline_avg_us)
+            if inf_lvl is not None:
+                inflexion_level = inf_lvl
+                inflexion_lat_avg = inf_lat
+                inflexion_criterio = criterio
+                buf = calcular_buffer(baseline_avg_us, inflexion_lat_avg)
+                print(f"\n  {C.OK}★ Inflexión detectada en nivel {inflexion_level}%{C.END}")
+                print(f"  Criterio: {inflexion_criterio}")
+                if buf:
+                    print(f"  Buffer: {buf:,} bytes ({buf/1024:.1f} KB)")
+                break
+
+    buffer_bytes = calcular_buffer(baseline_avg_us, inflexion_lat_avg)
+
+    return {
+        "protocol": protocol,
+        "pkt_size_b": pkt_size,
+        "baseline_avg_us": round(baseline_avg_us, 2) if baseline_avg_us else None,
+        "baseline_max_us": round(baseline_max_us, 2) if baseline_max_us else None,
+        "inflexion_level": inflexion_level,
+        "inflexion_lat_us": round(inflexion_lat_avg, 2) if inflexion_lat_avg else None,
+        "inflexion_criterio": inflexion_criterio,
+        "buffer_bytes": buffer_bytes,
+        "buffer_kb": round(buffer_bytes / 1024, 1) if buffer_bytes else None,
+        "levels": level_summaries,
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXPERIMENTO COMPLETO
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_experiment(topology, scenario, protocols, dry_run):
+    out_dir = OUTPUT_BASE / topology / "fase2_buffering"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*70}")
+    print(f"  F2-{scenario.upper()}  |  {topology.upper()}")
+    print(f"  {datetime.now():%Y-%m-%d %H:%M:%S}")
+    print(f"  Escenario: {SCENARIO['desc'][topology]}")
+    if scenario == "s2" and topology == "sl":
+        print(f"  BALANCEO MANUAL: flujos distribuidos entre S1 y S2")
+    print(f"  Protocolos: {', '.join(p.upper() for p in protocols)}")
+    print(f"  Niveles: {OVERSUB_LEVELS}")
+    print(f"  Tamaños: {PKT_SIZES} bytes")
+    print(f"  Reps: {REPS_MIN}-{REPS_MAX} (RSD < {RSD_TARGET}%)")
+    print(f"  Cooldown: {COOLDOWN}s")
+    print(f"  Salida: {out_dir}")
+    if dry_run:
+        print("  MODO: DRY-RUN")
+    print(f"{'='*70}\n")
+
+    all_results = []
+
+    for protocol in protocols:
+        print(f"\n{'─'*70}")
+        print(f"  Protocolo: {protocol.upper()}")
+        print(f"{'─'*70}")
+
+        if not dry_run:
+            start_iperf_servers(topology, dry_run)
+            ok("Servidores activos")
+
+        for pkt_size in PKT_SIZES:
+            result = run_protocol(topology, scenario, protocol, pkt_size, out_dir, dry_run)
+            all_results.append(result)
+
+        if not dry_run:
+            kill_iperf(SCENARIO["target_host"])
+            for alt_host in extra_target_hosts(topology):
+                kill_iperf(alt_host)
+            ok("Servidores apagados")
+
+        if protocol != protocols[-1]:
+            info("Pausa 15s antes del siguiente protocolo...")
+            if not dry_run:
+                time.sleep(15)
+
+    # RESUMEN FINAL
+    print(f"\n\n{'='*70}")
+    print(f"  RESUMEN F2-{scenario.upper()} — {topology.upper()}")
+    print(f"  {'Proto':>5}  {'PKT':>6}  {'Baseline(avg)':>12}  {'Inflexión':>10}  {'Criterio':>10}  {'Buffer':>12}")
+    print(f"  {'─'*5}  {'─'*6}  {'─'*12}  {'─'*10}  {'─'*10}  {'─'*12}")
+    for r in all_results:
+        buf_str = f"{r['buffer_kb']} KB" if r["buffer_kb"] else "no detectado"
+        inf_str = f"{r['inflexion_level']}%" if r["inflexion_level"] is not None else "N/A"
+        base_str = f"{r['baseline_avg_us']}µs" if r["baseline_avg_us"] else "N/A"
+        crit_str = r["inflexion_criterio"] if r.get("inflexion_criterio") else "N/A"
+        print(f"  {r['protocol'].upper():>5}  {r['pkt_size_b']:>6}B"
+              f"  {base_str:>12}  {inf_str:>10}  {crit_str:>10}  {buf_str:>12}")
+    print(f"{'='*70}\n")
+
+    summary_path = out_dir / f"{topology}_{EXPERIMENT_BASE}{scenario}_summary.json"
+    summary_path.write_text(json.dumps({
+        "experiment": f"{EXPERIMENT_BASE}{scenario}",
+        "topology": topology,
+        "scenario": SCENARIO["id"],
+        "rfc_reference": "RFC8239 §3 — Buffering Testing (corregido)",
+        "line_rate_bps": LINE_RATE_BPS,
+        "oversub_levels": OVERSUB_LEVELS,
+        "pkt_sizes": PKT_SIZES,
+        "inflection_rel_pct": INFLECTION_PCT,
+        "inflection_abs_us": INFLECTION_ABS_US,
+        "rsd_target": RSD_TARGET,
+        "reps_min": REPS_MIN,
+        "reps_max": REPS_MAX,
+        "duration_s": DURATION,
+        "cooldown_s": COOLDOWN,
+        "balanced": (scenario == "s2" and topology == "sl"),
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "results": all_results,
+    }, indent=2))
+    ok(f"Summary: {summary_path}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PREFLIGHT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def preflight():
+    involved = [SCENARIO["main_host"], SCENARIO["probe_host"], 
+                SCENARIO["target_host"]] + SCENARIO["extra_hosts"]
+    involved = sorted(set(involved))
+    print("-- Preflight " + "-"*50)
+    all_ok = True
+    for name in involved:
+        res = ssh_run(name, "iperf3 --version 2>&1 | head -1", timeout=10)
+        ok_iperf = res.returncode == 0
+        ver = res.stdout.strip()[:40] if ok_iperf else "no encontrado"
+        print(f"  {'OK' if ok_iperf else 'FAIL'} {name:4s}  {HOSTS[name]['ip']:15s}  {ver}")
+        if not ok_iperf:
+            all_ok = False
+        if name in (SCENARIO["probe_host"], SCENARIO["target_host"]):
+            res2 = ssh_run(name, "ping -c 1 127.0.0.1 >/dev/null 2>&1 && echo ok", timeout=8)
+            ok_png = res2.returncode == 0
+            print(f"  {'OK' if ok_png else 'FAIL'} {name:4s}  ping  {'disponible' if ok_png else 'no'}")
+            if not ok_png:
+                all_ok = False
+    print()
+    return all_ok
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="F2: Buffering Testing Unificado (S1 y S2) — CON BALANCEO MANUAL"
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=["s1", "s2", "all"],
+        required=True,
+        help="Escenario: s1 (2 ingress) o s2 (4 ingress)"
+    )
+    parser.add_argument(
+        "--topology",
+        choices=["sl", "j3c"],
+        default="sl",
+        help="Topología: sl (spine-leaf) o j3c (jerárquica 3 capas)"
+    )
+    parser.add_argument(
+        "--protocol",
+        choices=["udp", "tcp", "both"],
+        default="both",
+        help="Protocolo: udp, tcp, o both"
+    )
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--skip-preflight", action="store_true")
+    args = parser.parse_args()
+
+    global HOSTS, SCENARIO, args_global
+    args_global = args  # Guardar para usar en run_extra_flow
+    
+    # Fijar HOSTS
+    HOSTS = TOPOLOGIES[args.topology]["hosts"]
+    
+    # Fijar escenarios
+    if args.scenario == "all":
+        scenarios = ["s1", "s2"]
+    else:
+        scenarios = [args.scenario]
+    
+    protocols = ["udp", "tcp"] if args.protocol == "both" else [args.protocol]
+
+    for sc in scenarios:
+        sc_cfg = SCENARIOS[sc]
+        SCENARIO = {
+            "id": sc_cfg["id"],
+            "desc": sc_cfg["desc"],
+            "main_host": sc_cfg["main_host"],
+            "probe_host": sc_cfg["probe_host"],
+            "target_host": sc_cfg["target_host"][args.topology],
+            "extra_hosts": sc_cfg["extra_hosts"].get(args.topology, []) if isinstance(sc_cfg["extra_hosts"], dict) else sc_cfg["extra_hosts"],
+            "main_port": sc_cfg["main_port"],
+            "probe_port": sc_cfg["probe_port"],
+            "extra_ports": sc_cfg["extra_ports"],
+            "extra_targets": sc_cfg.get("extra_targets", {}),
+        }
+        
+        if not args.dry_run and not args.skip_preflight:
+            if not preflight():
+                print("  FAIL: Preflight falló.")
+                sys.exit(1)
+        
+        run_experiment(
+            topology=args.topology,
+            scenario=sc,
+            protocols=protocols,
+            dry_run=args.dry_run
+        )
+
+if __name__ == "__main__":
+    main()
