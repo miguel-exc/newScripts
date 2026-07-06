@@ -38,12 +38,12 @@ DURATION = 20
 COOLDOWN = 10          # CORREGIDO: 10s para drenaje completo
 PKT_PAUSE = 10
 RSD_TARGET = 10.0
-REPS_MIN = 2
-REPS_MAX = 2
+REPS_MIN = 15
+REPS_MAX = 30
 INFLECTION_PCT = 15.0
 INFLECTION_ABS_US = 500
 
-OVERSUB_LEVELS = [0, 2, 4, 6, 8]
+OVERSUB_LEVELS = [0, 2, 4, 6, 8, 10, 12, 15, 20, 30, 50]
 PKT_SIZES = [1518, 512]
 
 # Puertos usados por los servidores iperf3 en los hosts destino "secundarios"
