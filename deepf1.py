@@ -7,8 +7,10 @@ OBJETIVO: Comparar Spine-Leaf (con balanceo manual) vs Jerárquica 3 Capas
 en términos de throughput, equidad, latencia y jitter.
 
 CORRECCIONES (2026-07-09):
-  - B2 para j3c corregido: H1→H5, H2→H6, H3→H7, H4→H8 (Edge1→Edge2)
-  - Todos los flujos cruzan Core1
+  - j3c A1 corregido: H1→H5 (Edge1→Edge2, cruza Core1)
+  - j3c B1 corregido: H2→H4 (intra-Edge1), H3→H7 (Edge1→Edge2)
+  - j3c B2 corregido: H1→H5, H2→H6, H3→H7, H4→H8 (todos Edge1→Edge2)
+  - SL se mantiene con balanceo manual S1/S2
 
 Spine-Leaf: usa ambos spines (S1 y S2) de forma balanceada (pseudo-ECMP).
 Jerárquica 3 Capas: usa Core1 como punto de convergencia.
@@ -55,33 +57,20 @@ OUTPUT_BASE = Path.home() / "experimentos"
 EXPERIMENTS = {
     "a1": {
         "desc": "Par único (carga baja) — baseline",
-        "note": "F1-A1: par único",
-        "pairs": [
-            {"id": "p1", "client": "H1", "server": None, "port": 5201},  # server se asigna por topología
-        ]
+        "note": "F1-A1: par único cruzando el punto central de la topología",
     },
     "b1": {
         "desc": "2 pares cross-leaf",
         "note": "F1-B1: 2 pares cross-leaf simultáneos",
-        "pairs": [
-            {"id": "p1", "client": "H2", "server": None, "port": 5201},
-            {"id": "p2", "client": "H3", "server": None, "port": 5202},
-        ]
     },
     "b2": {
         "desc": "4 pares full-mesh",
         "note": "F1-B2: 4 flujos full-mesh",
-        "pairs": [
-            {"id": "p1", "client": "H1", "server": None, "port": 5201},
-            {"id": "p2", "client": "H2", "server": None, "port": 5202},
-            {"id": "p3", "client": "H3", "server": None, "port": 5203},
-            {"id": "p4", "client": "H4", "server": None, "port": 5204},  # j3c: H4→H8, SL: H6→H8
-        ]
     },
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONFIGURACIÓN POR TOPOLOGÍA
+#  CONFIGURACIÓN POR TOPOLOGÍA — CORREGIDA
 # ══════════════════════════════════════════════════════════════════════════════
 
 TOPOLOGIES = {
@@ -96,20 +85,20 @@ TOPOLOGIES = {
             "H7": {"ip": "10.0.3.1", "user": "h7"},
             "H8": {"ip": "10.0.3.2", "user": "h8"},
         },
-        # SL: Pares específicos por escenario
+        # SL: Pares específicos por escenario (balanceado entre S1 y S2)
         "pairs": {
             "a1": [
-                {"id": "p1", "client": "H1", "server": "H4", "port": 5201},
+                {"id": "p1", "client": "H1", "server": "H4", "port": 5201},  # Leaf1→Leaf2 (S1)
             ],
             "b1": [
-                {"id": "p1", "client": "H2", "server": "H4", "port": 5201},
-                {"id": "p2", "client": "H3", "server": "H7", "port": 5202},
+                {"id": "p1", "client": "H2", "server": "H4", "port": 5201},  # Leaf1→Leaf2 (S1)
+                {"id": "p2", "client": "H3", "server": "H7", "port": 5202},  # Leaf1→Leaf3 (S2)
             ],
             "b2": [
-                {"id": "p1", "client": "H1", "server": "H4", "port": 5201},  # L1→L2 (S1)
-                {"id": "p2", "client": "H2", "server": "H7", "port": 5202},  # L1→L3 (S2)
-                {"id": "p3", "client": "H3", "server": "H5", "port": 5203},  # L1→L2 (S1)
-                {"id": "p4", "client": "H6", "server": "H8", "port": 5204},  # L2→L3 (S2)
+                {"id": "p1", "client": "H1", "server": "H4", "port": 5201},  # Leaf1→Leaf2 (S1)
+                {"id": "p2", "client": "H2", "server": "H7", "port": 5202},  # Leaf1→Leaf3 (S2)
+                {"id": "p3", "client": "H3", "server": "H5", "port": 5203},  # Leaf1→Leaf2 (S1)
+                {"id": "p4", "client": "H6", "server": "H8", "port": 5204},  # Leaf2→Leaf3 (S2)
             ],
         },
         "desc": "Spine-Leaf (SL) — balanceado entre S1 y S2",
@@ -125,23 +114,23 @@ TOPOLOGIES = {
             "H7": {"ip": "10.0.2.3", "user": "h7"},
             "H8": {"ip": "10.0.2.4", "user": "h8"},
         },
-        # j3c: Pares específicos por escenario
+        # j3c: Pares específicos por escenario (todos cruzan Core1 cuando es cross-edge)
         "pairs": {
             "a1": [
-                {"id": "p1", "client": "H1", "server": "H4", "port": 5201},  # Intra-Edge1
+                {"id": "p1", "client": "H1", "server": "H5", "port": 5201},  # Edge1→Edge2 (CRUZA Core1)
             ],
             "b1": [
-                {"id": "p1", "client": "H2", "server": "H4", "port": 5201},  # Intra-Edge1
-                {"id": "p2", "client": "H3", "server": "H7", "port": 5202},  # Edge1→Edge2
+                {"id": "p1", "client": "H2", "server": "H4", "port": 5201},  # Intra-Edge1 (no cruza Core)
+                {"id": "p2", "client": "H3", "server": "H7", "port": 5202},  # Edge1→Edge2 (CRUZA Core1)
             ],
             "b2": [
-                {"id": "p1", "client": "H1", "server": "H5", "port": 5201},  # Edge1→Edge2
-                {"id": "p2", "client": "H2", "server": "H6", "port": 5202},  # Edge1→Edge2
-                {"id": "p3", "client": "H3", "server": "H7", "port": 5203},  # Edge1→Edge2
-                {"id": "p4", "client": "H4", "server": "H8", "port": 5204},  # Edge1→Edge2
+                {"id": "p1", "client": "H1", "server": "H5", "port": 5201},  # Edge1→Edge2 (CRUZA Core1)
+                {"id": "p2", "client": "H2", "server": "H6", "port": 5202},  # Edge1→Edge2 (CRUZA Core1)
+                {"id": "p3", "client": "H3", "server": "H7", "port": 5203},  # Edge1→Edge2 (CRUZA Core1)
+                {"id": "p4", "client": "H4", "server": "H8", "port": 5204},  # Edge1→Edge2 (CRUZA Core1)
             ],
         },
-        "desc": "Jerárquica 3 Capas (j3c) — todos cruzan Core1",
+        "desc": "Jerárquica 3 Capas (j3c) — flujos cruzan Core1 cuando son cross-edge",
     },
 }
 
